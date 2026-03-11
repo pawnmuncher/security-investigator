@@ -1,0 +1,795 @@
+---
+name: ai-agent-posture
+description: 'Use this skill when asked to audit, assess, or report on AI agent security posture across Copilot Studio and Microsoft 365 Copilot agents. Triggers on keywords like "AI agent posture", "agent security audit", "Copilot Studio agents", "agent inventory", "agent authentication", "unauthenticated agents", "agent tools", "MCP tools on agents", "agent knowledge sources", "XPIA risk", "agent sprawl", "AI agent risk", "agent governance", or when investigating AI agent configurations, access policies, tool permissions, or credential exposure. This skill queries the AIAgentsInfo table in Advanced Hunting to produce a comprehensive security posture assessment covering agent inventory, authentication gaps, access control misconfigurations, MCP tool proliferation, knowledge source exposure, XPIA email exfiltration risk, hard-coded credential detection, HTTP request risks, creator governance, and agent sprawl analysis. Supports inline chat and markdown file output.'
+---
+
+# AI Agent Security Posture — Instructions
+
+## Purpose
+
+This skill audits the **security posture of AI agents** (Copilot Studio / Microsoft 365 Copilot) across your organization using the `AIAgentsInfo` table in Microsoft Defender XDR Advanced Hunting.
+
+AI agents are autonomous or semi-autonomous applications that can access organizational data, send emails, call external APIs, and use MCP tools. Misconfigured agents — missing authentication, overly broad access, AI-controlled email sending, hard-coded credentials — represent a growing attack surface. This skill systematically evaluates that surface.
+
+**What this skill covers:**
+
+| Domain | Key Questions Answered |
+|--------|----------------------|
+| 🔍 **Agent Inventory** | How many agents exist? What's their status, platform, environment? |
+| 🔐 **Authentication & Access** | Which agents lack authentication? What access control policies are in use? |
+| 🛠️ **Tools & MCP** | Which agents have MCP tools? What operations can they perform? |
+| 📚 **Knowledge Sources** | What data sources are agents connected to (SharePoint, public sites, federated)? |
+| 📧 **XPIA Email Risk** | Which agents combine generative orchestration with email sending (data exfil risk)? |
+| 🔑 **Credential Exposure** | Are credentials hard-coded in agent topics or actions? |
+| 🌐 **HTTP Request Risk** | Do agents make HTTP requests to non-standard ports or sensitive endpoints? |
+| 👥 **Creator Governance** | Who creates agents? Is there naming hygiene? Abandoned agents? |
+
+**Data source:** `AIAgentsInfo` table (Advanced Hunting) — currently in **Preview**.
+
+**Reference:** [Microsoft Docs — AIAgentsInfo table](https://learn.microsoft.com/en-us/defender-xdr/advanced-hunting-aiagentsinfo-table)
+
+---
+
+## 📑 TABLE OF CONTENTS
+
+1. **[Critical Workflow Rules](#-critical-workflow-rules---read-first-)** — Mandatory rules
+2. **[Table Schema Reference](#table-schema-reference)** — AIAgentsInfo columns and data types
+3. **[Agent Security Score Formula](#agent-security-score-formula)** — Composite risk scoring
+4. **[Execution Workflow](#execution-workflow)** — Phase-by-phase query plan
+5. **[Sample KQL Queries](#sample-kql-queries)** — All queries (Q1–Q12)
+6. **[Output Modes](#output-modes)** — Inline vs Markdown report
+7. **[Inline Report Template](#inline-report-template)** — Chat-rendered format
+8. **[Markdown File Report Template](#markdown-file-report-template)** — Disk-saved format
+9. **[Known Pitfalls](#known-pitfalls)** — Schema quirks and edge cases
+10. **[Quality Checklist](#quality-checklist)** — Pre-delivery validation
+
+---
+
+## ⚠️ CRITICAL WORKFLOW RULES - READ FIRST ⚠️
+
+1. **ALWAYS use `RunAdvancedHuntingQuery`** — The `AIAgentsInfo` table is an Advanced Hunting table. It is NOT available in Sentinel Data Lake (`query_lake`). All queries in this skill MUST use `RunAdvancedHuntingQuery`.
+
+2. **ALWAYS deduplicate agents with `arg_max`** — The table contains multiple records per agent (state snapshots over time). Every query that analyzes current agent state MUST use `| summarize arg_max(Timestamp, *) by AIAgentId` to get the latest record per agent.
+
+3. **ALWAYS exclude deleted agents** (unless specifically auditing deletions) — Add `| where AgentStatus != "Deleted"` after deduplication.
+
+4. **ASK the user for output format** before generating the report:
+   - **Inline chat summary** (quick review in chat)
+   - **Markdown file report** (detailed, archived to `reports/ai-agent-posture/`)
+   - **Both** (markdown + inline summary)
+
+5. **⛔ MANDATORY: Evidence-based analysis only** — Report ONLY what query results show. Use the explicit absence pattern (`✅ No [finding] detected`) when queries return 0 results. Never guess or assume.
+
+6. **🔴 PROHIBITED: Do NOT filter `AgentToolsDetails` or `AgentTopicsDetails` with direct dot-notation on string columns** — These are `dynamic` type columns. Use `mv-expand` then access properties. See [Known Pitfalls](#known-pitfalls).
+
+7. **Run queries in parallel batches** where possible — Phase 1 queries (Q1–Q3) are independent and can run in parallel. Phase 2 queries (Q4–Q9) are independent and can run in parallel. Phase 3 (Q10–Q12) can run in parallel.
+
+8. **Time tracking** — Report elapsed time after each phase completion.
+
+---
+
+## Table Schema Reference
+
+The `AIAgentsInfo` table (Preview) contains configuration snapshots of AI agents from Copilot Studio.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `Timestamp` | datetime | Last recorded date/time for this agent snapshot |
+| `AIAgentId` | guid | Unique agent identifier |
+| `AIAgentName` | string | Display name of the agent |
+| `AgentCreationTime` | datetime | When the agent was created |
+| `CreatorAccountUpn` | string | UPN of the creator |
+| `OwnerAccountUpns` | string | UPNs of all owners |
+| `LastModifiedByUpn` | string | UPN of last modifier |
+| `LastModifiedTime` | datetime | When last modified |
+| `LastPublishedTime` | datetime | When last published |
+| `LastPublishedByUpn` | string | UPN of last publisher |
+| `AgentDescription` | string | Agent description |
+| `AgentStatus` | string | `Created`, `Published`, `Deleted` |
+| `UserAuthenticationType` | string | `None`, `Integrated`, `Custom` |
+| `AgentUsers` | string | UPNs/group IDs that can use the agent |
+| `KnowledgeDetails` | string | Knowledge sources (JSON array as string) |
+| `AgentActionTriggers` | string | Triggers for autonomous actions |
+| `RawAgentInfo` | string | Raw JSON config blob |
+| `AuthenticationTrigger` | string | `As Needed`, `Always` |
+| `AccessControlPolicy` | string | `Any`, `Agent readers`, `Group membership`, `Any (multitenant)` |
+| `AuthorizedSecurityGroupIds` | dynamic | Allowed AAD group IDs |
+| `AgentTopicsDetails` | dynamic | Topic specifications |
+| `AgentToolsDetails` | dynamic | Tool specifications |
+| `EnvironmentId` | string | Power Platform environment ID |
+| `Platform` | string | `Copilot Studio` |
+| `IsGenerativeOrchestrationEnabled` | bool | Uses dynamic AI orchestration |
+| `AgentAppId` | string | Entra app registration ID |
+| `ConnectedAgentsSchemaNames` | dynamic | Linked agent schemas |
+| `ChildAgentsSchemaNames` | dynamic | Child agent schemas |
+
+---
+
+## Agent Security Score Formula
+
+The Agent Security Score is a composite risk indicator that summarizes the security posture of an organization's AI agent fleet. Higher scores indicate greater risk.
+
+### Scoring Dimensions
+
+$$
+\text{AgentSecurityScore} = \sum_{i} \text{DimensionScore}_i
+$$
+
+Each dimension contributes 0–20 points to a maximum of 100:
+
+| Dimension | Max | 🟢 Low (0–5) | 🟡 Medium (6–12) | 🔴 High (13–20) |
+|-----------|-----|--------------|-------------------|------------------|
+| **Unauthenticated Agents** | 20 | 0 no-auth agents | 1 no-auth agent | ≥2 no-auth agents, especially if Published |
+| **XPIA Email Risk** | 20 | 0 agents with GenAI + email | 1 agent with GenAI + email (inputs hardcoded) | ≥1 agent with GenAI + email (inputs AI-controlled) |
+| **MCP Tool Exposure** | 20 | 0–2 MCP agents, known creators | 3–10 MCP agents | >10 MCP agents or agents with `invokemcpgraph` + broad access |
+| **Knowledge Source Risk** | 20 | 0 agents with SharePoint/internal sources + broad access | 1–3 agents with internal sources + scoped access | Agents with internal data sources + `AccessControlPolicy == "Any"` |
+| **Credential Hygiene** | 20 | 0 credential patterns detected | Patterns found but agent is unpublished (Created) | Patterns found in Published agents |
+
+### Interpretation Scale
+
+| Score | Rating | Action |
+|-------|--------|--------|
+| **0–20** | ✅ Healthy | Normal posture, no immediate concerns |
+| **21–45** | 🟡 Elevated | Review — minor misconfigurations detected |
+| **46–70** | 🟠 Concerning | Investigate — multiple risk signals present |
+| **71–100** | 🔴 Critical | Immediate remediation — significant agent security risk |
+
+---
+
+## Execution Workflow
+
+### Phase 0: Prerequisites
+
+1. Confirm `RunAdvancedHuntingQuery` is available (AIAgentsInfo is AH-only)
+2. Ask user for output format (inline / markdown / both)
+
+### Phase 1: Inventory & Overview (Q1–Q3)
+
+**Run in parallel — no dependencies between queries.**
+
+| Query | Purpose |
+|-------|---------|
+| Q1 | Global inventory summary (counts, date range, environments) |
+| Q2 | Status and authentication type breakdown |
+| Q3 | Access control policy distribution |
+
+### Phase 2: Security Risk Analysis (Q4–Q9)
+
+**Run in parallel — no dependencies between queries.**
+
+| Query | Purpose |
+|-------|---------|
+| Q4 | Unauthenticated agents (no-auth detail) |
+| Q5 | XPIA email exfiltration risk (GenAI + SendEmailV2) |
+| Q6 | MCP tool inventory across agents |
+| Q7 | Knowledge source audit |
+| Q8 | Hard-coded credential scan |
+| Q9 | HTTP request risk (non-standard ports / sensitive endpoints) |
+
+### Phase 3: Governance & Trends (Q10–Q12)
+
+**Run in parallel — no dependencies between queries.**
+
+| Query | Purpose |
+|-------|---------|
+| Q10 | Top creators and naming hygiene |
+| Q11 | Agent creation trend over time |
+| Q12 | Tools inventory (all tool types, not just MCP) |
+
+### Phase 4: Score Computation & Report Generation
+
+1. **Compute per-dimension scores** from Phase 1–3 data
+2. **Sum dimension scores** for composite Agent Security Score
+3. **Generate report** in requested output mode
+4. **Report total elapsed time**
+
+---
+
+## Sample KQL Queries
+
+> **All queries below are verified against the AIAgentsInfo table schema. Use them exactly as written, substituting only where noted.**
+
+### Query 1: Global Inventory Summary
+
+```kql
+AIAgentsInfo
+| summarize 
+    TotalRecords = count(),
+    UniqueAgents = dcount(AIAgentId),
+    EarliestRecord = min(Timestamp),
+    LatestRecord = max(Timestamp),
+    UniqueCreators = dcount(CreatorAccountUpn),
+    UniquePlatforms = dcount(Platform),
+    UniqueEnvironments = dcount(EnvironmentId)
+```
+
+### Query 2: Status & Authentication Breakdown
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| summarize AgentCount = count() by AgentStatus, UserAuthenticationType
+| order by AgentCount desc
+```
+
+### Query 3: Access Control Policy Distribution
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| summarize Count = count() by AccessControlPolicy
+| order by Count desc
+```
+
+### Query 4: Unauthenticated Agents (No-Auth Detail)
+
+🔴 **Security-critical query** — agents with `UserAuthenticationType == "None"` have no user authentication and may be publicly accessible.
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| where UserAuthenticationType == "None"
+| project 
+    AIAgentName, 
+    AgentStatus,
+    CreatorAccountUpn, 
+    OwnerAccountUpns,
+    AccessControlPolicy,
+    IsGenerativeOrchestrationEnabled,
+    AgentCreationTime,
+    LastModifiedTime,
+    AgentDescription,
+    EnvironmentId
+| order by AgentStatus desc, AgentCreationTime desc
+```
+
+**Post-processing:** For each unauthenticated agent, note:
+- Is it Published (active) or just Created (draft)?
+- Does it have generative orchestration enabled (higher risk)?
+- What is its access control policy (Any = highest risk)?
+- Cross-reference with Q5 (email tools) and Q6 (MCP tools) for compounding risk.
+
+### Query 5: XPIA Email Exfiltration Risk (GenAI + SendEmailV2)
+
+🔴 **Security-critical query** — agents combining generative orchestration with email-sending tools. A successful Cross-Plugin Injection Attack (XPIA) could use the AI orchestrator to exfiltrate data to arbitrary email recipients.
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| where IsGenerativeOrchestrationEnabled == true
+| mv-expand Action = AgentToolsDetails
+| extend OperationId = tostring(Action.action.operationId)
+| where OperationId == "SendEmailV2"
+| extend InputsPopulated = isnotempty(Action.inputs)
+| project 
+    AIAgentName,
+    AIAgentId,
+    CreatorAccountUpn,
+    OperationId,
+    InputsPopulated,
+    AccessControlPolicy,
+    UserAuthenticationType,
+    AgentStatus
+```
+
+**Post-processing:**
+- `InputsPopulated == false` → All email inputs (recipient, subject, body) are AI-controlled = **highest XPIA risk**
+- `InputsPopulated == true` → Some inputs hardcoded (e.g., fixed recipient) = **reduced but not eliminated risk**
+- Cross-reference with Q4: if agent also has `UserAuthenticationType == "None"`, flag as **double risk**.
+
+### Query 6: MCP Tool Inventory Across Agents
+
+🟠 **Governance query** — MCP tools give agents access to external servers, Graph API, Sentinel data, and more. Uncontrolled MCP proliferation increases the attack surface.
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| mv-expand Action = AgentToolsDetails
+| where Action.action.operationDetails["$kind"] == "ModelContextProtocolMetadata"
+| extend MCPName = tostring(Action.action.operationDetails["operationId"])
+| extend MCPDisplayName = tostring(Action.modelDisplayName)
+| summarize 
+    MCPTools = make_set(MCPName),
+    MCPToolCount = dcount(MCPName)
+    by AIAgentName, AIAgentId, CreatorAccountUpn, AccessControlPolicy, UserAuthenticationType
+| order by MCPToolCount desc
+```
+
+### Query 7: Knowledge Source Audit
+
+🟡 **Data exposure query** — identifies what data sources agents can access, including SharePoint sites, public websites, and federated data connectors.
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| where isnotempty(KnowledgeDetails)
+| mv-expand KnowledgeRaw = parse_json(KnowledgeDetails)
+| extend KnowledgeJson = parse_json(tostring(KnowledgeRaw))
+| extend SourceKind = tostring(KnowledgeJson.source["$kind"])
+| extend SourceSite = tostring(KnowledgeJson.source.site.literalValue)
+| project 
+    AIAgentName,
+    AIAgentId,
+    CreatorAccountUpn,
+    AccessControlPolicy,
+    UserAuthenticationType,
+    SourceKind,
+    SourceSite
+| order by SourceKind asc, AIAgentName asc
+```
+
+**Post-processing — flag high-risk combinations:**
+- `SharePointSearchSource` + `AccessControlPolicy == "Any"` → internal data exposed broadly
+- `PublicSiteSearchSource` to sensitive domains (government, financial)
+- `FederatedStructuredSearchSource` → check if connected to internal databases/APIs
+- Any knowledge source on an agent with `UserAuthenticationType == "None"`
+
+### Query 8: Hard-Coded Credential Scan
+
+🔴 **Security-critical query** — scans agent Topics and Actions for patterns matching API keys, JWTs, Basic auth headers, and other credential formats.
+
+```kql
+let suspicious_patterns = @"(AKIA[0-9A-Z]{16})|(AIza[0-9A-Za-z_\-]{35})|(xox[baprs]-[0-9a-zA-Z]{10,48})|(ghp_[A-Za-z0-9]{36,59})|(sk_(live|test)_[A-Za-z0-9]{24})|(SG\.[A-Za-z0-9]{22}\.[A-Za-z0-9]{43})|(\d{8}:[\w\-]{35})|(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)|(Authorization\s*:\s*Basic\s+[A-Za-z0-9=:+]+)|([A-Za-z]+:\/\/[^\/\s]+:[^\/\s]+@[^\/\s]+)";
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| mv-expand tool = AgentToolsDetails
+| mv-expand topic = AgentTopicsDetails
+| where isnotempty(tool) and isnotempty(topic)
+| where tool matches regex suspicious_patterns or topic matches regex suspicious_patterns
+| project 
+    AIAgentName,
+    AIAgentId,
+    AgentStatus,
+    CreatorAccountUpn,
+    OwnerAccountUpns
+```
+
+**Post-processing:**
+- Published agents with credential matches = **immediate remediation required**
+- Recommend Azure Key Vault + environment variables instead of hard-coded secrets
+
+### Query 9: HTTP Request Risk (Non-Standard Ports & Sensitive Endpoints)
+
+🟠 **Network risk query** — identifies agents making HTTP requests to non-standard ports or to sensitive API endpoints that should use built-in connectors.
+
+```kql
+// Part A: Non-standard ports
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| mv-expand Topic = AgentTopicsDetails
+| where Topic has "HttpRequestAction"
+| extend TopicActions = Topic.beginDialog.actions
+| mv-expand action = TopicActions
+| where action['$kind'] == "HttpRequestAction"
+| extend Url = tostring(action.url.literalValue)
+| extend ParsedUrl = parse_url(Url)
+| extend Host = tostring(ParsedUrl["Host"]), Port = tostring(ParsedUrl["Port"])
+| where isnotempty(Port) and Port != "443" and Port != "80"
+| project AIAgentName, CreatorAccountUpn, Host, Port, Url, AgentStatus, AccessControlPolicy
+```
+
+```kql
+// Part B: Sensitive endpoint detection (Graph, ARM)
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| mv-expand Topic = AgentTopicsDetails
+| where Topic has "HttpRequestAction"
+| extend TopicActions = Topic.beginDialog.actions
+| mv-expand action = TopicActions
+| where action['$kind'] == "HttpRequestAction"
+| extend Url = tostring(action.url.literalValue)
+| extend ParsedUrl = parse_url(Url)
+| extend Host = tostring(ParsedUrl["Host"])
+| where Host has_any ("graph.microsoft.com", "management.azure.com", "vault.azure.net", "login.microsoftonline.com")
+| project AIAgentName, CreatorAccountUpn, Host, Url, AgentStatus, AccessControlPolicy
+```
+
+### Query 10: Top Creators & Naming Hygiene
+
+👥 **Governance query** — identifies prolific agent creators and names lacking descriptiveness (e.g., generic "Agent" names).
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| summarize 
+    AgentCount = count(),
+    PublishedCount = countif(AgentStatus == "Published"),
+    GenericNameCount = countif(AIAgentName in~ ("Agent", "agent", "Test", "test")),
+    NoDescriptionCount = countif(isempty(AgentDescription)),
+    AgentNames = make_set(AIAgentName, 10)
+    by CreatorAccountUpn
+| order by AgentCount desc
+| take 20
+```
+
+### Query 11: Agent Creation Trend
+
+📈 **Trend query** — shows agent creation velocity over time to detect sprawl acceleration.
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| summarize AgentsCreated = count() by bin(AgentCreationTime, 7d)
+| order by AgentCreationTime asc
+```
+
+### Query 12: Full Tools Inventory (All Tool Types)
+
+🛠️ **Tools governance query** — catalogs all tools (not just MCP) across agents to understand the full capability surface.
+
+```kql
+AIAgentsInfo
+| summarize arg_max(Timestamp, *) by AIAgentId
+| where AgentStatus != "Deleted"
+| where isnotempty(AgentToolsDetails)
+| mv-expand Tool = AgentToolsDetails
+| extend 
+    ToolKind = tostring(Tool.action.operationDetails["$kind"]),
+    ToolDisplayName = tostring(Tool.modelDisplayName),
+    OperationId = tostring(Tool.action.operationId)
+| summarize AgentCount = dcount(AIAgentId), Agents = make_set(AIAgentName, 5) by ToolKind, OperationId, ToolDisplayName
+| order by AgentCount desc
+```
+
+---
+
+## Output Modes
+
+### Mode 1: Inline Chat Summary
+
+Render the full analysis directly in the chat response. Best for quick review.
+
+### Mode 2: Markdown File Report
+
+Save a comprehensive report to disk at:
+```
+reports/ai-agent-posture/AI_Agent_Posture_Report_YYYYMMDD_HHMMSS.md
+```
+
+### Mode 3: Both
+
+Generate the markdown file AND provide an inline summary in chat.
+
+**Always ask the user which mode before generating output.**
+
+---
+
+## Inline Report Template
+
+Render the following sections in order. Omit sections only if explicitly noted as conditional.
+
+````markdown
+# 🤖 AI Agent Security Posture Report
+
+**Generated:** YYYY-MM-DD HH:MM UTC
+**Data Source:** AIAgentsInfo (Advanced Hunting)
+**Analysis Period:** <EarliestRecord> → <LatestRecord>
+**Platform:** Copilot Studio
+
+---
+
+## Executive Summary
+
+<2-3 sentences: total agents, key risk findings, overall score>
+
+**Overall Risk Rating:** 🔴/🟠/🟡/✅ <RATING> (<Score>/100)
+
+---
+
+## Key Metrics
+
+| Metric | Value |
+|--------|-------|
+| Total Agents (non-deleted) | <N> |
+| Published Agents | <N> |
+| Created (Draft) Agents | <N> |
+| Unique Creators | <N> |
+| Environments | <N> |
+| Agents with No Authentication | <N> |
+| Agents with MCP Tools | <N> |
+| Agents with Knowledge Sources | <N> |
+| Agents with GenAI + Email (XPIA Risk) | <N> |
+
+---
+
+## 🔐 Authentication & Access Control
+
+### Authentication Types
+| Type | Count |
+|------|-------|
+| Integrated | <N> |
+| None | <N> |
+| Custom | <N> |
+
+### Access Control Policies
+| Policy | Count |
+|--------|-------|
+| Agent readers | <N> |
+| Group membership | <N> |
+| Any | <N> |
+| Any (multitenant) | <N> |
+
+### 🔴 Unauthenticated Agents
+
+<If Q4 returns results:>
+| Agent Name | Status | Creator | Access Policy | GenAI Enabled | Created |
+|------------|--------|---------|---------------|---------------|---------|
+| <name> | <status> | <upn> | <policy> | <yes/no> | <date> |
+
+<If Q4 returns 0:>
+✅ No unauthenticated agents detected.
+
+---
+
+## 📧 XPIA Email Exfiltration Risk
+
+<If Q5 returns results:>
+| Agent Name | Creator | Inputs AI-Controlled | Auth Type | Access Policy |
+|------------|---------|---------------------|-----------|---------------|
+| <name> | <upn> | 🔴 Yes / 🟢 No | <type> | <policy> |
+
+**Risk Assessment:**
+- 🔴 Agents with AI-controlled email inputs can be exploited via XPIA to exfiltrate data
+- ⚠️ Recommendation: Hardcode email recipients or remove SendEmailV2 from GenAI agents
+
+<If Q5 returns 0:>
+✅ No agents combine generative orchestration with email tools.
+
+---
+
+## 🛠️ MCP Tool Exposure
+
+<If Q6 returns results:>
+| Agent Name | Creator | MCP Tools | Access Policy | Auth Type |
+|------------|---------|-----------|---------------|-----------|
+| <name> | <upn> | <tool list> | <policy> | <type> |
+
+**MCP Tool Distribution:**
+| MCP Tool | Agent Count |
+|----------|-------------|
+| <tool> | <N> |
+
+<If Q6 returns 0:>
+✅ No agents with MCP tools detected.
+
+---
+
+## 📚 Knowledge Source Exposure
+
+<If Q7 returns results:>
+| Source Type | Count | Example |
+|-------------|-------|---------|
+| SharePointSearchSource | <N> | <sample site> |
+| PublicSiteSearchSource | <N> | <sample site> |
+| FederatedStructuredSearchSource | <N> | <sample> |
+
+**⚠️ High-Risk Combinations:**
+<List agents with internal data sources + broad access policies>
+
+<If Q7 returns 0:>
+✅ No knowledge sources configured on any agents.
+
+---
+
+## 🔑 Credential Hygiene
+
+<If Q8 returns results:>
+🔴 **Hard-coded credential patterns detected in <N> agent(s):**
+| Agent Name | Status | Creator |
+|------------|--------|---------|
+| <name> | <status> | <upn> |
+
+⚠️ **Recommendation:** Move secrets to Azure Key Vault; use environment variables at runtime.
+
+<If Q8 returns 0:>
+✅ No hard-coded credential patterns detected in agent topics or actions.
+
+---
+
+## 🌐 HTTP Request Risk
+
+<If Q9 returns results:>
+**Non-Standard Ports:**
+| Agent | Host | Port | URL |
+|-------|------|------|-----|
+
+**Sensitive Endpoints:**
+| Agent | Host | URL |
+|-------|------|-----|
+
+<If Q9 returns 0:>
+✅ No HTTP requests to non-standard ports or sensitive endpoints detected.
+
+---
+
+## 👥 Creator Governance
+
+### Top Creators
+| Creator | Agents | Published | Generic Names | No Description |
+|---------|--------|-----------|---------------|----------------|
+| <upn> | <N> | <N> | <N> | <N> |
+
+### Naming Hygiene
+- Agents with generic names ("Agent", "Test"): <N>
+- Agents with no description: <N>
+
+---
+
+## 📈 Agent Creation Trend
+
+<ASCII bar chart or summary table of Q11 results — weekly agent creation counts>
+
+---
+
+## 🛠️ Full Tools Inventory
+
+| Tool Kind | Operation | Agent Count | Example Agents |
+|-----------|-----------|-------------|----------------|
+| <kind> | <operationId> | <N> | <agent names> |
+
+---
+
+## Agent Security Score Card
+
+```
+┌──────────────────────────────────────────────────────┐
+│          AGENT SECURITY SCORE: <NN>/100              │
+│              Rating: <EMOJI> <RATING>                │
+├──────────────────────────────────────────────────────┤
+│ Unauth Agents    [<bar>] <N>/20  (<detail>)          │
+│ XPIA Email Risk  [<bar>] <N>/20  (<detail>)          │
+│ MCP Tool Exposure[<bar>] <N>/20  (<detail>)          │
+│ Knowledge Risk   [<bar>] <N>/20  (<detail>)          │
+│ Credential Hygn  [<bar>] <N>/20  (<detail>)          │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## Security Assessment
+
+| Factor | Finding |
+|--------|---------|
+| <emoji> **<Factor>** | <Evidence-based finding> |
+
+---
+
+## Recommendations
+
+1. <emoji> **<Priority action>** — <evidence and rationale>
+2. ...
+
+---
+
+## Appendix: Query Execution Summary
+
+| Query | Description | Records | Time |
+|-------|-------------|---------|------|
+| Q1 | Global Inventory | <N> | <time> |
+| Q2 | Status & Auth Breakdown | <N> | <time> |
+| ... | ... | ... | ... |
+````
+
+---
+
+## Markdown File Report Template
+
+When outputting to markdown file, use the same structure as the Inline Report Template above, saved to:
+
+```
+reports/ai-agent-posture/AI_Agent_Posture_Report_YYYYMMDD_HHMMSS.md
+```
+
+Include the following additional sections in the file report that are omitted from inline:
+
+1. **Full agent detail table** (all non-deleted agents with key fields)
+2. **Per-environment breakdown** (agent counts and creators by EnvironmentId)
+3. **Complete knowledge source listing** (every source URL, not just examples)
+4. **Complete MCP agent listing** (every MCP agent with full tool list)
+5. **Raw query references** — note that full query definitions are in this SKILL.md file
+
+### File Report Header
+
+```markdown
+# AI Agent Security Posture Report
+
+**Generated:** YYYY-MM-DD HH:MM UTC
+**Data Source:** AIAgentsInfo (Advanced Hunting — Preview)
+**Analysis Period:** <EarliestRecord> → <LatestRecord> (<N> days)
+**Platform:** Copilot Studio
+**Environments:** <N> (<list environment IDs>)
+**Total Agents:** <N> (Published: <N>, Created: <N>)
+
+---
+```
+
+---
+
+## Known Pitfalls
+
+### 1. AIAgentsInfo Is Advanced Hunting Only
+
+**Problem:** The `AIAgentsInfo` table does NOT exist in Sentinel Data Lake. Querying via `mcp_sentinel-data_query_lake` returns `SemanticError: Failed to resolve table`.
+
+**Solution:** Always use `RunAdvancedHuntingQuery`. The table has 30-day retention in AH.
+
+### 2. Multiple Records Per Agent (State Snapshots)
+
+**Problem:** The table logs configuration snapshots over time. Querying without deduplication returns inflated counts and duplicate agent entries.
+
+**Solution:** Always use `| summarize arg_max(Timestamp, *) by AIAgentId` to get the latest state per agent before any analysis.
+
+### 3. AgentToolsDetails and AgentTopicsDetails Are Dynamic
+
+**Problem:** `AgentToolsDetails` and `AgentTopicsDetails` are `dynamic` type columns containing arrays of objects. You must `mv-expand` before accessing nested properties.
+
+**Solution:** Always `mv-expand` first:
+```kql
+| mv-expand Tool = AgentToolsDetails
+| extend OperationId = tostring(Tool.action.operationId)
+```
+
+### 4. KnowledgeDetails Is a String Containing JSON
+
+**Problem:** Despite containing structured data, `KnowledgeDetails` is a `string` column. The string contains a JSON array where each element is itself a JSON string.
+
+**Solution:** Double-parse:
+```kql
+| mv-expand KnowledgeRaw = parse_json(KnowledgeDetails)
+| extend KnowledgeJson = parse_json(tostring(KnowledgeRaw))
+| extend SourceKind = tostring(KnowledgeJson.source["$kind"])
+```
+
+### 5. Table Is in Preview
+
+**Problem:** `AIAgentsInfo` is currently in Preview. Schema may change, columns may be added/removed, and data population depends on Copilot Studio and Defender XDR deployment.
+
+**Impact:** If the table returns 0 results, confirm that the organization has Copilot Studio agents and that the Defender XDR service is deployed.
+
+### 6. CreatorAccountUpn May Be Empty
+
+**Problem:** Some agents (e.g., system-created `Copilot in Power Apps`) have an empty `CreatorAccountUpn`.
+
+**Solution:** Handle empty creators gracefully in governance analysis. Filter or group them separately.
+
+### 7. Hard-Coded Credential Regex May Produce False Positives
+
+**Problem:** The Q8 credential scan regex matches patterns like JWT tokens (`eyJ...`), which may appear legitimately in topic definitions (e.g., example payloads in documentation topics).
+
+**Solution:** Always manually review matches. Flag Published agents as higher risk than Created (draft) agents.
+
+### 8. IsGenerativeOrchestrationEnabled May Be Null
+
+**Problem:** Some agents have `null` for `IsGenerativeOrchestrationEnabled` rather than `true`/`false`.
+
+**Solution:** Treat `null` as unknown. In Q5 (XPIA risk), filter explicitly on `== true` to avoid false positives.
+
+---
+
+## Quality Checklist
+
+Before delivering the report, verify:
+
+- [ ] All queries used `arg_max(Timestamp, *) by AIAgentId` for deduplication
+- [ ] All queries filtered `AgentStatus != "Deleted"` (unless auditing deletions)
+- [ ] All queries ran via `RunAdvancedHuntingQuery` (not Data Lake)
+- [ ] Zero-result queries are reported with explicit absence confirmation (✅ pattern)
+- [ ] The Agent Security Score calculation is transparent with per-dimension evidence
+- [ ] Unauthenticated agents are flagged with specific risk context (Published vs Created, GenAI, access policy)
+- [ ] XPIA email risk distinguishes AI-controlled vs hardcoded inputs
+- [ ] MCP tool inventory includes tool names, not just counts
+- [ ] Knowledge sources include source type and URL/site reference
+- [ ] Creator governance includes naming hygiene and abandoned agent analysis
+- [ ] Recommendations are prioritized and evidence-based
+- [ ] No PII from live environments in the SKILL.md file itself
